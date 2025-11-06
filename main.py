@@ -9,9 +9,17 @@ from datetime import datetime
 from pathlib import Path
 import numpy as np
 import sounddevice as sd
-from faster_whisper import WhisperModel
-from transformers import AutoTokenizer, AutoModelForCausalLM
+from faster_whisper import WhisperModel, BatchedInferencePipeline
+from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig, StoppingCriteria, StoppingCriteriaList
 import torch
+import torchaudio
+from tqdm import tqdm
+
+# Disable cuDNN for stability in WSL
+os.environ['CUDA_VISIBLE_DEVICES'] = '0'
+os.environ['TF_FORCE_GPU_ALLOW_GROWTH'] = 'true'
+
+torchaudio.set_audio_backend("soundfile")
 
 logging.basicConfig(
     level=logging.INFO,
@@ -25,8 +33,13 @@ logger = logging.getLogger(__name__)
 
 
 class Config:
-    WHISPER_MODEL_PATH = r"E:\Projects\Med_Scribe\Medscribe_testing\models\large-v3"
-    GEMMA_MODEL_PATH = r"E:\Projects\Med_Scribe\Medscribe_testing\models\finetuned\gemma-prescription-finetuned-it-merged_final"
+    # Detect platform and set paths accordingly
+    if sys.platform == "linux":
+        WHISPER_MODEL_PATH = "/mnt/e/Projects/Med_Scribe/Medscribe_testing/models/large-v3"
+        GEMMA_MODEL_PATH = "/mnt/e/Projects/Med_Scribe/Medscribe_testing/models/finetuned/gemma-prescription-finetuned-it-merged_final"
+    else:
+        WHISPER_MODEL_PATH = r"E:\Projects\Med_Scribe\Medscribe_testing\models\large-v3"
+        GEMMA_MODEL_PATH = r"E:\Projects\Med_Scribe\Medscribe_testing\models\finetuned\gemma-prescription-finetuned-it-merged_final"
     
     SAMPLE_RATE = 16000
     AUDIO_CHUNK_DURATION = 3
@@ -38,6 +51,10 @@ class Config:
     
     DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
     COMPUTE_TYPE = "float16" if torch.cuda.is_available() else "int8"
+    
+    WHISPER_BEAM_SIZE = 4
+    WHISPER_BATCH_SIZE = 8
+    WHISPER_VAD_FILTER = True
 
 
 class AudioCapture:
@@ -120,26 +137,34 @@ class TranscriptionEngine:
     def __init__(self, model_path=Config.WHISPER_MODEL_PATH):
         self.model_path = model_path
         self.model = None
+        self.batched_model = None
         self.transcription_queue = queue.Queue(maxsize=Config.MAX_QUEUE_SIZE)
         self.is_running = False
         
     def load_model(self):
         try:
             logger.info(f"Loading Faster Whisper model from {self.model_path}")
-            self.model = WhisperModel(
-                self.model_path,
-                device=Config.DEVICE,
-                compute_type=Config.COMPUTE_TYPE,
-                cpu_threads=4,
-                num_workers=2
-            )
-            logger.info("Faster Whisper model loaded successfully")
+            
+            with tqdm(total=100, desc="Loading Whisper Model", ncols=80, bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt}') as pbar:
+                pbar.update(20)
+                self.model = WhisperModel(
+                    self.model_path,
+                    device=Config.DEVICE,
+                    compute_type=Config.COMPUTE_TYPE,
+                    local_files_only=True
+                )
+                pbar.update(60)
+                
+                self.batched_model = BatchedInferencePipeline(model=self.model)
+                pbar.update(20)
+            
+            logger.info("Whisper model loaded successfully")
         except Exception as e:
             logger.error(f"Failed to load Whisper model: {e}")
             raise
     
     def transcribe_audio(self, audio_data):
-        if self.model is None:
+        if self.batched_model is None:
             logger.error("Model not loaded")
             return None
         
@@ -149,23 +174,17 @@ class TranscriptionEngine:
                 logger.debug("Silence detected, skipping transcription")
                 return None
             
-            segments, info = self.model.transcribe(
+            segments, info = self.batched_model.transcribe(
                 audio_data,
-                task="translate",
-                language="hi",
-                beam_size=5,
-                vad_filter=True,
-                vad_parameters=dict(
-                    min_silence_duration_ms=500,
-                    speech_pad_ms=400
-                )
+                language='en',
+                beam_size=Config.WHISPER_BEAM_SIZE,
+                vad_filter=Config.WHISPER_VAD_FILTER,
+                batch_size=Config.WHISPER_BATCH_SIZE,
+                word_timestamps=False
             )
             
-            transcription = ""
-            for segment in segments:
-                transcription += segment.text + " "
-            
-            transcription = transcription.strip()
+            transcript_chunks = [segment.text.strip() for segment in segments if segment.text.strip()]
+            transcription = " ".join(transcript_chunks)
             
             if transcription:
                 logger.info(f"Transcription: {transcription}")
@@ -217,6 +236,7 @@ class GemmaProcessor:
         self.model_path = model_path
         self.model = None
         self.tokenizer = None
+        self.stopping_criteria = None
         self.is_running = False
         self.accumulated_text = []
         self.last_json_output = {}
@@ -225,18 +245,49 @@ class GemmaProcessor:
         try:
             logger.info(f"Loading Gemma model from {self.model_path}")
             
-            self.tokenizer = AutoTokenizer.from_pretrained(self.model_path)
-            self.model = AutoModelForCausalLM.from_pretrained(
-                self.model_path,
-                torch_dtype=torch.float16 if Config.DEVICE == "cuda" else torch.float32,
-                device_map="auto" if Config.DEVICE == "cuda" else None,
-                low_cpu_mem_usage=True
-            )
-            
-            if Config.DEVICE == "cpu":
-                self.model = self.model.to(Config.DEVICE)
-            
-            self.model.eval()
+            with tqdm(total=100, desc="Loading Gemma Model", ncols=80, bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt}') as pbar:
+                pbar.update(10)
+                
+                bnb_config = BitsAndBytesConfig(
+                    load_in_4bit=True,
+                    bnb_4bit_quant_type="nf4",
+                    bnb_4bit_compute_dtype=torch.float16,
+                    bnb_4bit_use_double_quant=True
+                )
+                pbar.update(10)
+                
+                self.tokenizer = AutoTokenizer.from_pretrained(
+                    self.model_path,
+                    local_files_only=True
+                )
+                pbar.update(20)
+                
+                self.model = AutoModelForCausalLM.from_pretrained(
+                    self.model_path,
+                    quantization_config=bnb_config,
+                    device_map="auto",
+                    torch_dtype=torch.float16,
+                    low_cpu_mem_usage=True,
+                    local_files_only=True
+                )
+                pbar.update(50)
+                
+                self.model.eval()
+                
+                class StopOnBackticks(StoppingCriteria):
+                    def __init__(self, tokenizer, stop_sequence="AAA"):
+                        self.tokenizer = tokenizer
+                        self.stop_sequence = stop_sequence
+                        self.stop_ids = tokenizer.encode(stop_sequence, add_special_tokens=False)
+
+                    def __call__(self, input_ids, scores, **kwargs):
+                        if len(input_ids[0]) >= len(self.stop_ids):
+                            if (input_ids[0][-len(self.stop_ids):] == torch.tensor(self.stop_ids, device=input_ids.device)).all():
+                                return True
+                        return False
+                
+                self.stopping_criteria = StoppingCriteriaList([StopOnBackticks(self.tokenizer)])
+                pbar.update(10)
             
             logger.info("Gemma model loaded successfully")
         except Exception as e:
@@ -245,26 +296,53 @@ class GemmaProcessor:
     
     def extract_json_from_text(self, text):
         try:
-            inputs = self.tokenizer(text, return_tensors="pt", truncation=True, max_length=512)
-            inputs = {k: v.to(Config.DEVICE) for k, v in inputs.items()}
+            system_prompt = """
+You are a medical prescription parser. Extract ONLY information explicitly stated.
+
+Rules:
+1. Extract medicines with EXACT dosages mentioned
+2. If dosage/frequency unclear, mark as "unspecified"
+3. Do NOT infer or assume any information
+4. If doctor says "continue previous meds", extract NOTHING
+5. Output only one valid JSON object and stop
+6. At the end of the Output print AAA
+
+Output format:
+{
+  "medicines": [{"name": str, "dosage": str, "frequency": str, "duration": str}],
+  "diseases": [str],
+  "tests": [{"name": str, "timing": str}]
+}
+"""
+            
+            user_prompt = f"""
+{system_prompt}
+Extract from this prescription conversation:
+{text}
+
+Remember: Only extract explicitly stated information. No assumptions.
+"""
+            
+            inputs = self.tokenizer(user_prompt, return_tensors='pt').to(self.model.device)
             
             with torch.no_grad():
                 outputs = self.model.generate(
                     **inputs,
                     max_new_tokens=512,
-                    temperature=0.7,
-                    do_sample=True,
-                    top_p=0.9,
-                    pad_token_id=self.tokenizer.eos_token_id
+                    temperature=0.01,
+                    pad_token_id=self.tokenizer.pad_token_id,
+                    eos_token_id=self.tokenizer.eos_token_id,
+                    stopping_criteria=self.stopping_criteria,
+                    do_sample=False
                 )
             
-            generated_text = self.tokenizer.decode(outputs[0], skip_special_tokens=True)
+            result_text = self.tokenizer.decode(outputs[0], skip_special_tokens=True)
             
-            start_idx = generated_text.find('{')
-            end_idx = generated_text.rfind('}')
+            start_idx = result_text.find('{')
+            end_idx = result_text.rfind('}')
             
             if start_idx != -1 and end_idx != -1:
-                json_str = generated_text[start_idx:end_idx + 1]
+                json_str = result_text[start_idx:end_idx + 1]
                 json_data = json.loads(json_str)
                 return json_data
             else:
@@ -351,16 +429,22 @@ class MedScribeSystem:
         self.is_running = False
         
     def initialize(self):
-        logger.info("Initializing MedScribe system...")
+        print("\n" + "="*60)
+        print("Initializing MedScribe System")
+        print("="*60 + "\n")
         
         try:
-            logger.info("Loading Whisper model (this may take a few moments)...")
+            print("Step 1/2: Loading Whisper Model...")
             self.transcription_engine.load_model()
+            print("✓ Whisper model loaded\n")
             
-            logger.info("Loading Gemma model (this may take a few moments)...")
+            print("Step 2/2: Loading Gemma Model...")
             self.gemma_processor.load_model()
+            print("✓ Gemma model loaded\n")
             
-            logger.info("All models loaded successfully")
+            print("="*60)
+            print("All models loaded successfully!")
+            print("="*60 + "\n")
             return True
             
         except Exception as e:
