@@ -14,12 +14,18 @@ from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
 import torch
 import torchaudio
 from tqdm import tqdm
+import tempfile
+import soundfile as sf
 
-# Disable cuDNN for stability in WSL
-os.environ['CUDA_VISIBLE_DEVICES'] = '0'
-os.environ['TF_FORCE_GPU_ALLOW_GROWTH'] = 'true'
+# Disable cuDNN for stability in WSL - prevents crashes
+os.environ['CUDA_MODULE_LOADING'] = 'LAZY'
 
-torchaudio.set_audio_backend("soundfile")
+# Remove deprecated torchaudio warning
+if hasattr(torchaudio, 'set_audio_backend'):
+    try:
+        torchaudio.set_audio_backend("soundfile")
+    except:
+        pass
 
 logging.basicConfig(
     level=logging.INFO,
@@ -54,7 +60,7 @@ class Config:
     
     WHISPER_BEAM_SIZE = 4
     WHISPER_BATCH_SIZE = 8
-    WHISPER_VAD_FILTER = True
+    WHISPER_VAD_FILTER = True  # Safe to use with file-based transcription
 
 
 class AudioCapture:
@@ -168,14 +174,21 @@ class TranscriptionEngine:
             logger.error("Model not loaded")
             return None
         
+        temp_file = None
         try:
             rms = np.sqrt(np.mean(audio_data ** 2))
             if rms < Config.SILENCE_THRESHOLD:
                 logger.debug("Silence detected, skipping transcription")
                 return None
             
+            # Save audio to temporary file - this avoids cuDNN issues
+            with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as temp_file:
+                sf.write(temp_file.name, audio_data, Config.SAMPLE_RATE)
+                temp_filename = temp_file.name
+            
+            # Transcribe from file instead of numpy array
             segments, info = self.batched_model.transcribe(
-                audio_data,
+                temp_filename,
                 language='en',
                 beam_size=Config.WHISPER_BEAM_SIZE,
                 vad_filter=Config.WHISPER_VAD_FILTER,
@@ -186,6 +199,12 @@ class TranscriptionEngine:
             transcript_chunks = [segment.text.strip() for segment in segments if segment.text.strip()]
             transcription = " ".join(transcript_chunks)
             
+            # Clean up temp file
+            try:
+                os.unlink(temp_filename)
+            except:
+                pass
+            
             if transcription:
                 logger.info(f"Transcription: {transcription}")
                 return transcription
@@ -195,6 +214,11 @@ class TranscriptionEngine:
                 
         except Exception as e:
             logger.error(f"Transcription error: {e}")
+            if temp_file:
+                try:
+                    os.unlink(temp_file.name)
+                except:
+                    pass
             return None
     
     def process_audio_queue(self, audio_queue):
@@ -208,7 +232,16 @@ class TranscriptionEngine:
                 if audio_chunk is None:
                     continue
                 
-                transcription = self.transcribe_audio(audio_chunk)
+                # Wrap transcription in try-except to catch cuDNN crashes
+                try:
+                    transcription = self.transcribe_audio(audio_chunk)
+                except SystemError as e:
+                    logger.error(f"System error during transcription (likely cuDNN): {e}")
+                    logger.info("Attempting to continue...")
+                    continue
+                except Exception as e:
+                    logger.error(f"Unexpected error during transcription: {e}")
+                    continue
                 
                 if transcription and not self.transcription_queue.full():
                     self.transcription_queue.put(transcription)

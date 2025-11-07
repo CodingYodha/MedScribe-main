@@ -19,6 +19,23 @@ def test_imports():
         return False
     
     try:
+        import soundfile
+        print(f"  soundfile: {soundfile.__version__}")
+    except ImportError as e:
+        print(f"  soundfile: FAILED - {e}")
+        return False
+    
+    try:
+        import torchaudio
+        print(f"  torchaudio: {torchaudio.__version__}")
+        torchaudio.set_audio_backend("soundfile")
+        backends = torchaudio.list_audio_backends()
+        print(f"  torchaudio backends: {backends}")
+    except ImportError as e:
+        print(f"  torchaudio: FAILED - {e}")
+        return False
+    
+    try:
         import faster_whisper
         print(f"  faster-whisper: OK")
     except ImportError as e:
@@ -30,6 +47,13 @@ def test_imports():
         print(f"  transformers: {transformers.__version__}")
     except ImportError as e:
         print(f"  transformers: FAILED - {e}")
+        return False
+    
+    try:
+        import bitsandbytes
+        print(f"  bitsandbytes: OK")
+    except ImportError as e:
+        print(f"  bitsandbytes: FAILED - {e}")
         return False
     
     try:
@@ -63,8 +87,13 @@ def test_audio_devices():
 def test_model_paths():
     print("\nTesting model paths...")
     
-    whisper_path = Path(r"E:\Projects\Med_Scribe\Medscribe_testing\models\large-v3")
-    gemma_path = Path(r"E:\Projects\Med_Scribe\Medscribe_testing\models\finetuned\gemma-prescription-finetuned-it-merged_final")
+    # Convert Windows paths to WSL paths if running in WSL
+    if sys.platform == "linux":
+        whisper_path = Path("/mnt/e/Projects/Med_Scribe/Medscribe_testing/models/large-v3")
+        gemma_path = Path("/mnt/e/Projects/Med_Scribe/Medscribe_testing/models/finetuned/gemma-prescription-finetuned-it-merged_final")
+    else:
+        whisper_path = Path(r"E:\Projects\Med_Scribe\Medscribe_testing\models\large-v3")
+        gemma_path = Path(r"E:\Projects\Med_Scribe\Medscribe_testing\models\finetuned\gemma-prescription-finetuned-it-merged_final")
     
     if whisper_path.exists():
         print(f"  Whisper model path: OK")
