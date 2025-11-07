@@ -8,6 +8,35 @@ echo "============================================================"
 echo "MedScribe - WSL2 cuDNN Compatibility Mode"
 echo "============================================================"
 echo ""
+
+# Check if model server is running
+echo "Checking model server status..."
+if curl -s http://127.0.0.1:5000/health > /dev/null 2>&1; then
+    echo "✓ Model server is running"
+    SERVER_STATUS=$(curl -s http://127.0.0.1:5000/health | grep -o '"model_loaded":[^,]*' | cut -d':' -f2)
+    if [ "$SERVER_STATUS" = "true" ]; then
+        echo "✓ Model is loaded in VRAM"
+    else
+        echo "⚠ Model server found but model not loaded yet"
+        echo "  Wait for model to finish loading..."
+    fi
+else
+    echo "✗ Model server not running!"
+    echo ""
+    echo "Please start the model server first:"
+    echo "  bash start_model_server.sh"
+    echo ""
+    echo "OR in background:"
+    echo "  bash start_model_server.sh background"
+    echo ""
+    read -p "Continue anyway? (y/N) " -n 1 -r
+    echo
+    if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+        exit 1
+    fi
+fi
+
+echo ""
 echo "Applying WSL2 fixes..."
 
 # CRITICAL: Disable cuDNN v8 API (WSL2 incompatible)
@@ -35,7 +64,7 @@ echo "  - PYTORCH_NO_CUDA_MEMORY_CACHING=1 (no caching)"
 echo ""
 echo "Device Strategy:"
 echo "  - Whisper: CPU (avoid cuDNN crashes)"
-echo "  - Gemma: GPU (cuDNN not required)"
+echo "  - Gemma: Model Server (persistent in VRAM)"
 echo ""
 echo "============================================================"
 echo "Starting MedScribe..."
