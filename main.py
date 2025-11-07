@@ -29,6 +29,7 @@ import sounddevice as sd
 from faster_whisper import WhisperModel, BatchedInferencePipeline
 from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig, StoppingCriteria, StoppingCriteriaList
 from tqdm import tqdm
+import requests  # For model server communication
 
 
 logging.basicConfig(
@@ -89,6 +90,9 @@ class AudioCapture:
         self.buffer = []
         self.lock = threading.Lock()
         
+        # WSL2-specific: Increase latency to prevent timeout
+        self.latency = 'high'  # High latency mode for WSL2 compatibility
+        
     def audio_callback(self, indata, frames, time_info, status):
         if status:
             logger.warning(f"Audio callback status: {status}")
@@ -116,6 +120,44 @@ class AudioCapture:
         except Exception as e:
             logger.error(f"Error in audio callback: {e}")
     
+    def verify_audio_system(self):
+        """Verify audio system is working before starting stream"""
+        try:
+            logger.info("Verifying audio system...")
+            
+            # Check if devices exist
+            devices = sd.query_devices()
+            logger.info(f"  Found {len(devices)} audio devices")
+            
+            # Check default input
+            default_input = sd.default.device[0]
+            logger.info(f"  Default input device: {default_input}")
+            
+            # Try a very short test recording (non-blocking)
+            logger.info("  Testing audio capture (1 second test)...")
+            test_duration = 1.0
+            test_recording = sd.rec(
+                int(test_duration * self.sample_rate),
+                samplerate=self.sample_rate,
+                channels=1,
+                dtype=np.float32,
+                blocking=False
+            )
+            
+            # Wait with timeout
+            sd.wait(timeout=5.0)  # 5 second timeout for 1 second recording
+            
+            if test_recording is not None and len(test_recording) > 0:
+                logger.info("  ✓ Audio system test passed")
+                return True
+            else:
+                logger.warning("  ⚠ Audio system test produced no data")
+                return False
+                
+        except Exception as e:
+            logger.error(f"  ✗ Audio system test failed: {e}")
+            return False
+    
     def start(self):
         if self.is_running:
             logger.warning("Audio capture already running")
@@ -123,15 +165,52 @@ class AudioCapture:
         
         try:
             self.is_running = True
+            
+            # WSL2 Fix: Use larger blocksize and explicit latency
+            blocksize = int(self.sample_rate * 0.2)  # 200ms blocks instead of 100ms
+            
+            logger.info("Initializing audio stream (WSL2 compatibility mode)...")
+            logger.info(f"  Sample rate: {self.sample_rate} Hz")
+            logger.info(f"  Block size: {blocksize} samples ({blocksize/self.sample_rate:.3f}s)")
+            logger.info(f"  Latency: {self.latency}")
+            
+            # Check if PulseAudio is responsive first
+            try:
+                sd.query_devices()
+            except Exception as e:
+                logger.error(f"Audio device query failed: {e}")
+                raise RuntimeError("Audio system not responsive. Is PulseAudio running?")
+            
             self.stream = sd.InputStream(
                 samplerate=self.sample_rate,
                 channels=1,
                 dtype=np.float32,
-                blocksize=int(self.sample_rate * 0.1),
-                callback=self.audio_callback
+                blocksize=blocksize,  # Larger blocks for WSL2
+                latency=self.latency,  # Explicit high latency
+                callback=self.audio_callback,
+                # WSL2 critical: Don't request real-time priority
+                prime_output_buffers_using_stream_callback=False
             )
+            
+            # Start with timeout handling
+            logger.info("Starting audio stream (this may take 10-15 seconds in WSL2)...")
             self.stream.start()
-            logger.info(f"Audio capture started - Sample rate: {self.sample_rate} Hz")
+            
+            # Verify stream is actually running
+            time.sleep(0.5)
+            if not self.stream.active:
+                raise RuntimeError("Stream started but not active")
+            
+            logger.info(f"✓ Audio capture started successfully")
+            
+        except sd.PortAudioError as e:
+            logger.error(f"PortAudio error: {e}")
+            logger.error("Troubleshooting steps:")
+            logger.error("  1. Run: pulseaudio --check")
+            logger.error("  2. Run: pulseaudio --start")
+            logger.error("  3. Check WSL2 audio passthrough is enabled")
+            self.is_running = False
+            raise
         except Exception as e:
             logger.error(f"Failed to start audio capture: {e}")
             self.is_running = False
@@ -268,138 +347,90 @@ class TranscriptionEngine:
 
 
 class GemmaProcessor:
-    def __init__(self, model_path=Config.GEMMA_MODEL_PATH):
-        self.model_path = model_path
-        self.model = None
-        self.tokenizer = None
-        self.stopping_criteria = None
+    """Lightweight client for Gemma Model Server (Ollama-style)"""
+    
+    def __init__(self, server_url="http://127.0.0.1:5000", model_path=None):
+        self.server_url = server_url
+        self.model_path = model_path  # Not used, kept for compatibility
         self.is_running = False
         self.accumulated_text = []
         self.last_json_output = {}
         
     def load_model(self):
+        """Check if model server is ready (model already loaded in VRAM)"""
         try:
-            logger.info(f"Loading Gemma model from {self.model_path}")
-            logger.info(f"Device: {Config.GEMMA_DEVICE} (GPU mode for performance)")
+            logger.info(f"Connecting to Gemma model server at {self.server_url}")
             
-            with tqdm(total=100, desc="Loading Gemma Model", ncols=80, bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt}') as pbar:
-                pbar.update(10)
-                
-                # 4-bit quantization for 6GB VRAM constraint
-                bnb_config = BitsAndBytesConfig(
-                    load_in_4bit=True,
-                    bnb_4bit_quant_type="nf4",
-                    bnb_4bit_compute_dtype=torch.float16,
-                    bnb_4bit_use_double_quant=True
-                )
-                pbar.update(10)
-                
-                self.tokenizer = AutoTokenizer.from_pretrained(
-                    self.model_path,
-                    local_files_only=True
-                )
-                pbar.update(20)
-                
-                # Load on GPU with memory constraints for 6GB VRAM
-                self.model = AutoModelForCausalLM.from_pretrained(
-                    self.model_path,
-                    quantization_config=bnb_config,
-                    device_map="auto",
-                    max_memory=Config.MAX_MEMORY_ALLOCATION,  # 5GB limit
-                    torch_dtype=torch.float16,
-                    low_cpu_mem_usage=True,
-                    local_files_only=True
-                )
-                pbar.update(50)
-                
-                self.model.eval()
-                
-                # Log GPU memory usage
-                if torch.cuda.is_available():
-                    allocated = torch.cuda.memory_allocated(0) / 1024**3
-                    reserved = torch.cuda.memory_reserved(0) / 1024**3
-                    logger.info(f"GPU Memory: {allocated:.2f}GB allocated, {reserved:.2f}GB reserved")
-                
-                class StopOnBackticks(StoppingCriteria):
-                    def __init__(self, tokenizer, stop_sequence="AAA"):
-                        self.tokenizer = tokenizer
-                        self.stop_sequence = stop_sequence
-                        self.stop_ids = tokenizer.encode(stop_sequence, add_special_tokens=False)
-
-                    def __call__(self, input_ids, scores, **kwargs):
-                        if len(input_ids[0]) >= len(self.stop_ids):
-                            if (input_ids[0][-len(self.stop_ids):] == torch.tensor(self.stop_ids, device=input_ids.device)).all():
-                                return True
-                        return False
-                
-                self.stopping_criteria = StoppingCriteriaList([StopOnBackticks(self.tokenizer)])
-                pbar.update(10)
+            response = requests.get(f"{self.server_url}/health", timeout=5)
             
-            logger.info(f"✓ Gemma model loaded successfully on {Config.GEMMA_DEVICE}")
+            if response.status_code == 200:
+                data = response.json()
+                if data.get('model_loaded'):
+                    vram = data.get('vram_allocated_gb', 0)
+                    logger.info("✓ Connected to model server")
+                    logger.info(f"  Model already in VRAM: {vram:.2f}GB")
+                    logger.info(f"  Inference will be INSTANT - no loading time!")
+                    return True
+                else:
+                    logger.error("Model server found but model not loaded")
+                    logger.error("Wait for model server to finish loading...")
+                    return False
+            else:
+                logger.error(f"Model server returned status {response.status_code}")
+                return False
+                
+        except requests.exceptions.ConnectionError:
+            logger.error("Cannot connect to model server!")
+            logger.error("\n" + "="*60)
+            logger.error("Please start the model server first:")
+            logger.error("")
+            logger.error("  Option 1 (Foreground):")
+            logger.error("    bash start_model_server.sh")
+            logger.error("")
+            logger.error("  Option 2 (Background):")
+            logger.error("    bash start_model_server.sh background")
+            logger.error("")
+            logger.error("  Option 3 (Manual):")
+            logger.error("    python model_server.py --model-path /path/to/gemma")
+            logger.error("="*60 + "\n")
+            return False
+        except requests.exceptions.Timeout:
+            logger.error("Model server health check timed out")
+            return False
         except Exception as e:
-            logger.error(f"Failed to load Gemma model: {e}")
-            raise
+            logger.error(f"Failed to connect to model server: {e}")
+            return False
     
     def extract_json_from_text(self, text):
+        """Send text to model server for processing"""
         try:
-            system_prompt = """
-You are a medical prescription parser. Extract ONLY information explicitly stated.
-
-Rules:
-1. Extract medicines with EXACT dosages mentioned
-2. If dosage/frequency unclear, mark as "unspecified"
-3. Do NOT infer or assume any information
-4. If doctor says "continue previous meds", extract NOTHING
-5. Output only one valid JSON object and stop
-6. At the end of the Output print AAA
-
-Output format:
-{
-  "medicines": [{"name": str, "dosage": str, "frequency": str, "duration": str}],
-  "diseases": [str],
-  "tests": [{"name": str, "timing": str}]
-}
-"""
+            response = requests.post(
+                f"{self.server_url}/generate",
+                json={'text': text},
+                timeout=30  # Inference should be fast (model in VRAM)
+            )
             
-            user_prompt = f"""
-{system_prompt}
-Extract from this prescription conversation:
-{text}
-
-Remember: Only extract explicitly stated information. No assumptions.
-"""
-            
-            inputs = self.tokenizer(user_prompt, return_tensors='pt').to(self.model.device)
-            
-            with torch.no_grad():
-                outputs = self.model.generate(
-                    **inputs,
-                    max_new_tokens=512,
-                    temperature=0.01,
-                    pad_token_id=self.tokenizer.pad_token_id,
-                    eos_token_id=self.tokenizer.eos_token_id,
-                    stopping_criteria=self.stopping_criteria,
-                    do_sample=False
-                )
-            
-            result_text = self.tokenizer.decode(outputs[0], skip_special_tokens=True)
-            
-            start_idx = result_text.find('{')
-            end_idx = result_text.rfind('}')
-            
-            if start_idx != -1 and end_idx != -1:
-                json_str = result_text[start_idx:end_idx + 1]
-                json_data = json.loads(json_str)
-                return json_data
+            if response.status_code == 200:
+                result = response.json()
+                if result.get('success'):
+                    return result.get('data')
+                else:
+                    logger.warning(f"Server returned no JSON: {result.get('error')}")
+                    return None
             else:
-                logger.warning("No JSON found in generated text")
+                logger.error(f"Server error {response.status_code}: {response.text}")
                 return None
                 
-        except json.JSONDecodeError as e:
-            logger.error(f"JSON decode error: {e}")
+        except requests.exceptions.Timeout:
+            logger.error("Model server request timed out (>30 sec)")
+            logger.warning("This shouldn't happen with model in VRAM - check server logs")
+            return None
+        except requests.exceptions.ConnectionError:
+            logger.error("Lost connection to model server!")
+            logger.error("Check if server is still running: curl http://127.0.0.1:5000/health")
             return None
         except Exception as e:
-            logger.error(f"Error extracting JSON: {e}")
+            logger.error(f"Error calling model server: {e}")
             return None
     
     def merge_json_data(self, new_data):
@@ -482,7 +513,7 @@ class MedScribeSystem:
         # Log device configuration
         print("Device Configuration:")
         print(f"  Whisper: {Config.WHISPER_DEVICE} ({Config.WHISPER_COMPUTE_TYPE})")
-        print(f"  Gemma: {Config.GEMMA_DEVICE} ({Config.GEMMA_COMPUTE_TYPE})")
+        print(f"  Gemma: Model Server (HTTP) - model stays in VRAM")
         if torch.cuda.is_available():
             print(f"  GPU: {torch.cuda.get_device_name(0)}")
             print(f"  CUDA Version: {torch.version.cuda}")
@@ -496,12 +527,22 @@ class MedScribeSystem:
             self.transcription_engine.load_model()
             print("✓ Whisper model loaded\n")
             
-            print("Step 2/2: Loading Gemma Model...")
-            self.gemma_processor.load_model()
-            print("✓ Gemma model loaded\n")
+            print("Step 2/2: Connecting to Gemma Model Server...")
+            if not self.gemma_processor.load_model():
+                print("\n" + "="*60)
+                print("⚠ Model server not ready")
+                print("="*60)
+                print("\nPLEASE START MODEL SERVER FIRST:")
+                print("  bash start_model_server.sh")
+                print("\nOR in background:")
+                print("  bash start_model_server.sh background")
+                print("\nWait 4-5 minutes for model to load, then run main.py again")
+                print("="*60 + "\n")
+                return False
+            print("✓ Connected to model server\n")
             
             print("="*60)
-            print("All models loaded successfully!")
+            print("All systems ready!")
             print("="*60 + "\n")
             return True
             
@@ -515,6 +556,17 @@ class MedScribeSystem:
             return
         
         try:
+            # WSL2: Verify audio before starting
+            logger.info("Running pre-flight audio check...")
+            if not self.audio_capture.verify_audio_system():
+                logger.error("Audio system verification failed. Cannot start system.")
+                logger.error("\nWSL2 Audio Setup Instructions:")
+                logger.error("1. Install PulseAudio in WSL2: sudo apt install pulseaudio")
+                logger.error("2. Start PulseAudio: pulseaudio --start")
+                logger.error("3. Check status: pulseaudio --check")
+                logger.error("4. In Windows: Enable WSL2 audio in Settings > System > Sound")
+                return
+            
             self.is_running = True
             
             self.audio_capture.start()
