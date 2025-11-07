@@ -1,0 +1,53 @@
+2025-11-06 19:09:00,465 - INFO - Initializing MedScribe system...
+2025-11-06 19:09:00,466 - INFO - Loading Whisper model (this may take a few moments)...
+2025-11-06 19:09:00,470 - INFO - Loading Faster Whisper model from /mnt/e/Projects/Med_Scribe/Medscribe_testing/models/large-v3
+2025-11-06 19:09:56,459 - INFO - Whisper model loaded successfully
+2025-11-06 19:09:56,460 - INFO - Converted to batched inference pipeline
+2025-11-06 19:09:56,460 - INFO - Loading Gemma model (this may take a few moments)...
+2025-11-06 19:09:56,460 - INFO - Loading Gemma model from /mnt/e/Projects/Med_Scribe/Medscribe_testing/models/finetuned/gemma-prescription-finetuned-it-merged_final
+2025-11-06 19:10:01,828 - INFO - We will use 90% of the memory on device 0 for storing the model, and 10% for the buffer to avoid OOM. You can set `max_memory` in to a higher value to use more memory (at your own risk).
+2025-11-06 19:14:23,510 - INFO - Gemma model loaded successfully
+2025-11-06 19:14:23,515 - INFO - All models loaded successfully
+2025-11-06 19:14:23,910 - INFO - Audio capture started - Sample rate: 16000 Hz
+2025-11-06 19:14:23,912 - INFO - Transcription thread started
+2025-11-06 19:14:23,913 - INFO - Gemma processing thread started
+2025-11-06 19:14:23,913 - INFO - MedScribe system started successfully
+2025-11-06 19:14:23,915 - INFO - Listening for audio input... Press Ctrl+C to stop
+2025-11-06 19:14:26,699 - INFO - Processing audio with duration 00:03.000
+2025-11-06 19:14:26,818 - INFO - VAD filter removed 00:01.904 of audio
+2025-11-06 19:20:06,907 - INFO - Loading Faster Whisper model from /mnt/e/Projects/Med_Scribe/Medscribe_testing/models/large-v3
+2025-11-06 19:20:45,696 - INFO - Whisper model loaded successfully
+2025-11-06 19:20:45,698 - INFO - Loading Gemma model from /mnt/e/Projects/Med_Scribe/Medscribe_testing/models/finetuned/gemma-prescription-finetuned-it-merged_final
+2025-11-06 19:20:52,516 - INFO - We will use 90% of the memory on device 0 for storing the model, and 10% for the buffer to avoid OOM. You can set `max_memory` in to a higher value to use more memory (at your own risk).
+2025-11-06 19:25:23,362 - INFO - Gemma model loaded successfully
+2025-11-06 19:25:23,711 - INFO - Audio capture started - Sample rate: 16000 Hz
+2025-11-06 19:25:23,712 - INFO - Transcription thread started
+2025-11-06 19:25:23,712 - INFO - Gemma processing thread started
+2025-11-06 19:25:23,712 - INFO - MedScribe system started successfully
+2025-11-06 19:25:23,713 - INFO - Listening for audio input... Press Ctrl+C to stop
+2025-11-06 19:25:35,359 - INFO - Processing audio with duration 00:03.000
+2025-11-06 19:25:35,498 - INFO - VAD filter removed 00:01.216 of audio
+2025-11-06 19:30:00,394 - INFO - Loading Faster Whisper model from /mnt/e/Projects/Med_Scribe/Medscribe_testing/models/large-v3
+2025-11-06 19:30:48,152 - INFO - Whisper model loaded successfully
+2025-11-06 19:30:48,155 - INFO - Loading Gemma model from /mnt/e/Projects/Med_Scribe/Medscribe_testing/models/finetuned/gemma-prescription-finetuned-it-merged_final
+2025-11-06 19:30:53,548 - INFO - We will use 90% of the memory on device 0 for storing the model, and 10% for the buffer to avoid OOM. You can set `max_memory` in to a higher value to use more memory (at your own risk).
+2025-11-06 19:35:35,794 - INFO - Gemma model loaded successfully
+2025-11-06 19:35:36,273 - INFO - Audio capture started - Sample rate: 16000 Hz
+2025-11-06 19:35:36,276 - INFO - Transcription thread started
+2025-11-06 19:35:36,276 - INFO - Gemma processing thread started
+2025-11-06 19:35:36,277 - INFO - MedScribe system started successfully
+2025-11-06 19:35:36,281 - INFO - Listening for audio input... Press Ctrl+C to stop
+2025-11-06 19:35:57,417 - INFO - Processing audio with duration 00:03.000
+2025-11-06 19:35:57,428 - INFO - VAD filter removed 00:00.000 of audio
+2025-11-06 19:55:49,536 - INFO - Loading Faster Whisper model from /mnt/e/Projects/Med_Scribe/Medscribe_testing/models/large-v3
+2025-11-06 19:56:30,471 - INFO - Whisper model loaded successfully
+2025-11-06 19:56:30,472 - INFO - Loading Gemma model from /mnt/e/Projects/Med_Scribe/Medscribe_testing/models/finetuned/gemma-prescription-finetuned-it-merged_final
+2025-11-06 19:56:35,889 - INFO - We will use 90% of the memory on device 0 for storing the model, and 10% for the buffer to avoid OOM. You can set `max_memory` in to a higher value to use more memory (at your own risk).
+2025-11-06 20:01:12,000 - INFO - Gemma model loaded successfully
+2025-11-06 20:01:12,476 - INFO - Audio capture started - Sample rate: 16000 Hz
+2025-11-06 20:01:12,478 - INFO - Transcription thread started
+2025-11-06 20:01:12,479 - INFO - Gemma processing thread started
+2025-11-06 20:01:12,479 - INFO - MedScribe system started successfully
+2025-11-06 20:01:12,482 - INFO - Listening for audio input... Press Ctrl+C to stop
+2025-11-06 20:01:28,326 - INFO - Processing audio with duration 00:03.000
+2025-11-06 20:01:28,434 - INFO - VAD filter removed 00:01.992 of audio

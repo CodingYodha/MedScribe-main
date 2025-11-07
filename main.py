@@ -1,5 +1,22 @@
+#main.py
+# CRITICAL: Set environment variables BEFORE any CUDA imports
+# This must be at the absolute top to prevent cuDNN from loading
 import os
 import sys
+
+# WSL2 cuDNN Compatibility Fix - MUST be before torch import
+os.environ['CUDA_MODULE_LOADING'] = 'LAZY'
+os.environ['TORCH_CUDNN_V8_API_ENABLED'] = '0'
+os.environ['PYTORCH_NO_CUDA_MEMORY_CACHING'] = '1'
+
+# Now import torch and disable cuDNN globally
+import torch
+# Force disable cuDNN - critical for WSL2 stability
+torch.backends.cudnn.enabled = False
+torch.backends.cudnn.benchmark = False
+torch.backends.cudnn.deterministic = True
+
+# Now safe to import other CUDA-dependent libraries
 import json
 import time
 import queue
@@ -11,21 +28,8 @@ import numpy as np
 import sounddevice as sd
 from faster_whisper import WhisperModel, BatchedInferencePipeline
 from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig, StoppingCriteria, StoppingCriteriaList
-import torch
-import torchaudio
 from tqdm import tqdm
-import tempfile
-import soundfile as sf
 
-# Disable cuDNN for stability in WSL - prevents crashes
-os.environ['CUDA_MODULE_LOADING'] = 'LAZY'
-
-# Remove deprecated torchaudio warning
-if hasattr(torchaudio, 'set_audio_backend'):
-    try:
-        torchaudio.set_audio_backend("soundfile")
-    except:
-        pass
 
 logging.basicConfig(
     level=logging.INFO,
@@ -47,6 +51,7 @@ class Config:
         WHISPER_MODEL_PATH = r"E:\Projects\Med_Scribe\Medscribe_testing\models\large-v3"
         GEMMA_MODEL_PATH = r"E:\Projects\Med_Scribe\Medscribe_testing\models\finetuned\gemma-prescription-finetuned-it-merged_final"
     
+    # Audio configuration
     SAMPLE_RATE = 16000
     AUDIO_CHUNK_DURATION = 3
     AUDIO_CHUNK_SAMPLES = SAMPLE_RATE * AUDIO_CHUNK_DURATION
@@ -55,12 +60,22 @@ class Config:
     SILENCE_THRESHOLD = 0.01
     MAX_QUEUE_SIZE = 100
     
-    DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-    COMPUTE_TYPE = "float16" if torch.cuda.is_available() else "int8"
+    # CRITICAL: Separate device configuration for Whisper and Gemma
+    # Whisper uses CPU to avoid WSL2 cuDNN crashes
+    # Gemma uses GPU for speed (doesn't use problematic cuDNN operations)
+    WHISPER_DEVICE = "cpu"  # Force CPU - WSL2 cuDNN is broken for Whisper
+    WHISPER_COMPUTE_TYPE = "int8"  # CPU-optimized precision
     
+    GEMMA_DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+    GEMMA_COMPUTE_TYPE = "float16"
+    
+    # Whisper inference parameters
     WHISPER_BEAM_SIZE = 4
     WHISPER_BATCH_SIZE = 8
-    WHISPER_VAD_FILTER = True  # Safe to use with file-based transcription
+    WHISPER_VAD_FILTER = True
+    
+    # GPU memory management for 6GB VRAM
+    MAX_MEMORY_ALLOCATION = {0: "5GB"}  # Reserve 5GB for GPU, leave 1GB buffer
 
 
 class AudioCapture:
@@ -150,13 +165,15 @@ class TranscriptionEngine:
     def load_model(self):
         try:
             logger.info(f"Loading Faster Whisper model from {self.model_path}")
+            logger.info(f"Device: {Config.WHISPER_DEVICE} (CPU mode for WSL2 cuDNN compatibility)")
             
             with tqdm(total=100, desc="Loading Whisper Model", ncols=80, bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt}') as pbar:
                 pbar.update(20)
+                # Force Whisper to CPU to avoid cuDNN crashes in WSL2
                 self.model = WhisperModel(
                     self.model_path,
-                    device=Config.DEVICE,
-                    compute_type=Config.COMPUTE_TYPE,
+                    device=Config.WHISPER_DEVICE,  # CPU only
+                    compute_type=Config.WHISPER_COMPUTE_TYPE,  # int8 for CPU efficiency
                     local_files_only=True
                 )
                 pbar.update(60)
@@ -164,7 +181,7 @@ class TranscriptionEngine:
                 self.batched_model = BatchedInferencePipeline(model=self.model)
                 pbar.update(20)
             
-            logger.info("Whisper model loaded successfully")
+            logger.info(f"✓ Whisper model loaded successfully on {Config.WHISPER_DEVICE}")
         except Exception as e:
             logger.error(f"Failed to load Whisper model: {e}")
             raise
@@ -174,21 +191,17 @@ class TranscriptionEngine:
             logger.error("Model not loaded")
             return None
         
-        temp_file = None
         try:
+            # Check for silence
             rms = np.sqrt(np.mean(audio_data ** 2))
             if rms < Config.SILENCE_THRESHOLD:
                 logger.debug("Silence detected, skipping transcription")
                 return None
             
-            # Save audio to temporary file - this avoids cuDNN issues
-            with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as temp_file:
-                sf.write(temp_file.name, audio_data, Config.SAMPLE_RATE)
-                temp_filename = temp_file.name
-            
-            # Transcribe from file instead of numpy array
+            # Direct numpy array transcription - safe on CPU
+            # (cuDNN is disabled globally, so this won't crash)
             segments, info = self.batched_model.transcribe(
-                temp_filename,
+                audio_data,  # Direct numpy array - no temp file needed
                 language='en',
                 beam_size=Config.WHISPER_BEAM_SIZE,
                 vad_filter=Config.WHISPER_VAD_FILTER,
@@ -199,12 +212,6 @@ class TranscriptionEngine:
             transcript_chunks = [segment.text.strip() for segment in segments if segment.text.strip()]
             transcription = " ".join(transcript_chunks)
             
-            # Clean up temp file
-            try:
-                os.unlink(temp_filename)
-            except:
-                pass
-            
             if transcription:
                 logger.info(f"Transcription: {transcription}")
                 return transcription
@@ -214,11 +221,6 @@ class TranscriptionEngine:
                 
         except Exception as e:
             logger.error(f"Transcription error: {e}")
-            if temp_file:
-                try:
-                    os.unlink(temp_file.name)
-                except:
-                    pass
             return None
     
     def process_audio_queue(self, audio_queue):
@@ -232,12 +234,13 @@ class TranscriptionEngine:
                 if audio_chunk is None:
                     continue
                 
-                # Wrap transcription in try-except to catch cuDNN crashes
+                # Transcribe with proper error handling
                 try:
                     transcription = self.transcribe_audio(audio_chunk)
-                except SystemError as e:
-                    logger.error(f"System error during transcription (likely cuDNN): {e}")
-                    logger.info("Attempting to continue...")
+                except torch.cuda.OutOfMemoryError as e:
+                    logger.error(f"CUDA OOM error: {e}")
+                    logger.info("Clearing CUDA cache...")
+                    torch.cuda.empty_cache()
                     continue
                 except Exception as e:
                     logger.error(f"Unexpected error during transcription: {e}")
@@ -277,10 +280,12 @@ class GemmaProcessor:
     def load_model(self):
         try:
             logger.info(f"Loading Gemma model from {self.model_path}")
+            logger.info(f"Device: {Config.GEMMA_DEVICE} (GPU mode for performance)")
             
             with tqdm(total=100, desc="Loading Gemma Model", ncols=80, bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt}') as pbar:
                 pbar.update(10)
                 
+                # 4-bit quantization for 6GB VRAM constraint
                 bnb_config = BitsAndBytesConfig(
                     load_in_4bit=True,
                     bnb_4bit_quant_type="nf4",
@@ -295,10 +300,12 @@ class GemmaProcessor:
                 )
                 pbar.update(20)
                 
+                # Load on GPU with memory constraints for 6GB VRAM
                 self.model = AutoModelForCausalLM.from_pretrained(
                     self.model_path,
                     quantization_config=bnb_config,
                     device_map="auto",
+                    max_memory=Config.MAX_MEMORY_ALLOCATION,  # 5GB limit
                     torch_dtype=torch.float16,
                     low_cpu_mem_usage=True,
                     local_files_only=True
@@ -306,6 +313,12 @@ class GemmaProcessor:
                 pbar.update(50)
                 
                 self.model.eval()
+                
+                # Log GPU memory usage
+                if torch.cuda.is_available():
+                    allocated = torch.cuda.memory_allocated(0) / 1024**3
+                    reserved = torch.cuda.memory_reserved(0) / 1024**3
+                    logger.info(f"GPU Memory: {allocated:.2f}GB allocated, {reserved:.2f}GB reserved")
                 
                 class StopOnBackticks(StoppingCriteria):
                     def __init__(self, tokenizer, stop_sequence="AAA"):
@@ -322,7 +335,7 @@ class GemmaProcessor:
                 self.stopping_criteria = StoppingCriteriaList([StopOnBackticks(self.tokenizer)])
                 pbar.update(10)
             
-            logger.info("Gemma model loaded successfully")
+            logger.info(f"✓ Gemma model loaded successfully on {Config.GEMMA_DEVICE}")
         except Exception as e:
             logger.error(f"Failed to load Gemma model: {e}")
             raise
@@ -465,6 +478,18 @@ class MedScribeSystem:
         print("\n" + "="*60)
         print("Initializing MedScribe System")
         print("="*60 + "\n")
+        
+        # Log device configuration
+        print("Device Configuration:")
+        print(f"  Whisper: {Config.WHISPER_DEVICE} ({Config.WHISPER_COMPUTE_TYPE})")
+        print(f"  Gemma: {Config.GEMMA_DEVICE} ({Config.GEMMA_COMPUTE_TYPE})")
+        if torch.cuda.is_available():
+            print(f"  GPU: {torch.cuda.get_device_name(0)}")
+            print(f"  CUDA Version: {torch.version.cuda}")
+            print(f"  cuDNN: DISABLED (WSL2 compatibility mode)")
+        else:
+            print("  GPU: Not available")
+        print()
         
         try:
             print("Step 1/2: Loading Whisper Model...")
