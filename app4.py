@@ -8,8 +8,13 @@ import io
 import wave
 from faster_whisper import WhisperModel
 from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
-from audiorecorder import audiorecorder
 import time
+import tempfile
+import threading
+import queue
+from collections import deque
+import sounddevice as sd
+import scipy.io.wavfile as wavfile
 
 # --- Model Loading ---
 
@@ -66,8 +71,77 @@ def load_gemma_model():
 
 # --- Audio Processing ---
 
-def save_audio_to_wav(audio_data, sample_rate=16000):
-    """Convert audio data to WAV format in memory."""
+class AudioRecorder:
+    """Real-time audio recorder using sounddevice."""
+    
+    def __init__(self, sample_rate=16000, chunk_duration=30):
+        self.sample_rate = sample_rate
+        self.chunk_duration = chunk_duration
+        self.chunk_samples = chunk_duration * sample_rate
+        self.audio_queue = queue.Queue()
+        self.is_recording = False
+        self.audio_buffer = []
+        self.stream = None
+        
+    def audio_callback(self, indata, frames, time_info, status):
+        """Callback function for audio stream."""
+        if status:
+            print(f"Audio status: {status}")
+        
+        # Add audio data to buffer
+        self.audio_buffer.extend(indata[:, 0].copy())
+        
+        # Check if we have enough data for a chunk
+        if len(self.audio_buffer) >= self.chunk_samples:
+            # Extract chunk
+            chunk = np.array(self.audio_buffer[:self.chunk_samples], dtype=np.float32)
+            self.audio_queue.put(chunk)
+            
+            # Keep overlap (last 2 seconds) for continuity
+            overlap_samples = 2 * self.sample_rate
+            self.audio_buffer = self.audio_buffer[self.chunk_samples - overlap_samples:]
+    
+    def start_recording(self):
+        """Start recording audio."""
+        self.is_recording = True
+        self.audio_buffer = []
+        self.stream = sd.InputStream(
+            samplerate=self.sample_rate,
+            channels=1,
+            callback=self.audio_callback,
+            blocksize=int(self.sample_rate * 0.5)  # 0.5 second blocks
+        )
+        self.stream.start()
+    
+    def stop_recording(self):
+        """Stop recording and return any remaining audio."""
+        self.is_recording = False
+        if self.stream:
+            self.stream.stop()
+            self.stream.close()
+        
+        # Process remaining buffer
+        if len(self.audio_buffer) > 0:
+            remaining = np.array(self.audio_buffer, dtype=np.float32)
+            self.audio_queue.put(remaining)
+            self.audio_buffer = []
+    
+    def get_audio_chunk(self):
+        """Get next audio chunk from queue (non-blocking)."""
+        try:
+            return self.audio_queue.get_nowait()
+        except queue.Empty:
+            return None
+
+def save_audio_chunk_to_wav(audio_data, sample_rate=16000):
+    """Convert numpy audio array to WAV file in memory."""
+    # Ensure audio is in correct format
+    audio_data = np.array(audio_data, dtype=np.float32)
+    
+    # Normalize and convert to int16
+    audio_data = np.clip(audio_data * 32767, -32768, 32767).astype(np.int16)
+    
+    # Create WAV file in memory
     buffer = io.BytesIO()
     with wave.open(buffer, 'wb') as wf:
         wf.setnchannels(1)
@@ -76,62 +150,6 @@ def save_audio_to_wav(audio_data, sample_rate=16000):
         wf.writeframes(audio_data.tobytes())
     buffer.seek(0)
     return buffer
-
-def detect_silence(audio_chunk, threshold=500, min_silence_duration=1.5):
-    """Detect if audio chunk contains significant silence at the end."""
-    if len(audio_chunk) == 0:
-        return False
-    
-    # Check last portion of audio for silence
-    sample_rate = 16000
-    silence_samples = int(min_silence_duration * sample_rate)
-    
-    if len(audio_chunk) < silence_samples:
-        return False
-    
-    last_portion = audio_chunk[-silence_samples:]
-    rms = np.sqrt(np.mean(last_portion**2))
-    
-    return rms < threshold
-
-def split_audio_intelligently(audio_data, sample_rate=16000, chunk_duration=30, overlap_duration=2):
-    """Split audio into chunks with overlap to preserve context at boundaries."""
-    chunk_samples = chunk_duration * sample_rate
-    overlap_samples = overlap_duration * sample_rate
-    
-    chunks = []
-    start = 0
-    
-    while start < len(audio_data):
-        end = min(start + chunk_samples, len(audio_data))
-        chunk = audio_data[start:end]
-        
-        # If this is not the last chunk, try to find a silence point for better split
-        if end < len(audio_data):
-            # Look for silence in the last 3 seconds of the chunk
-            search_start = max(0, len(chunk) - 3 * sample_rate)
-            silence_found = False
-            
-            for i in range(search_start, len(chunk) - sample_rate):
-                window = chunk[i:i + int(0.5 * sample_rate)]
-                rms = np.sqrt(np.mean(window**2))
-                
-                if rms < 300:  # Silence threshold
-                    chunk = chunk[:i + int(0.5 * sample_rate)]
-                    silence_found = True
-                    break
-            
-            if not silence_found:
-                # No silence found, use overlap
-                start = end - overlap_samples
-            else:
-                start = start + len(chunk) - overlap_samples
-        else:
-            start = end
-        
-        chunks.append(chunk)
-    
-    return chunks
 
 # --- JSON Extraction ---
 
@@ -231,31 +249,26 @@ def merge_json_outputs(json_list):
         "instructions": []
     }
     
-    # Track unique items
     med_names = set()
     
     for json_obj in json_list:
         if not json_obj:
             continue
         
-        # Merge medicines (avoid duplicates by name)
         for med in json_obj.get("medicines", []):
             med_name = med.get("name", "").lower()
             if med_name and med_name not in med_names:
                 merged["medicines"].append(med)
                 med_names.add(med_name)
         
-        # Merge diseases (unique)
         for disease in json_obj.get("diseases", []):
             if disease and disease not in merged["diseases"]:
                 merged["diseases"].append(disease)
         
-        # Merge symptoms (unique)
         for symptom in json_obj.get("symptoms", []):
             if symptom and symptom not in merged["symptoms"]:
                 merged["symptoms"].append(symptom)
         
-        # Merge tests (unique by name)
         test_names = {t.get("name", "").lower() for t in merged["tests"]}
         for test in json_obj.get("tests", []):
             test_name = test.get("name", "").lower()
@@ -263,20 +276,19 @@ def merge_json_outputs(json_list):
                 merged["tests"].append(test)
                 test_names.add(test_name)
         
-        # Merge instructions (unique)
         for instruction in json_obj.get("instructions", []):
             if instruction and instruction not in merged["instructions"]:
                 merged["instructions"].append(instruction)
     
     return merged
 
-# --- Streaming Processing ---
+# --- Processing Functions ---
 
-def process_audio_chunk(audio_chunk, whisper_model, gemma_tokenizer, gemma_model, sample_rate=16000):
+def process_audio_chunk(audio_chunk, whisper_model, gemma_tokenizer, gemma_model):
     """Process a single audio chunk and return extracted entities."""
     try:
         # Convert to WAV format
-        wav_buffer = save_audio_to_wav(audio_chunk, sample_rate)
+        wav_buffer = save_audio_chunk_to_wav(audio_chunk)
         
         # Transcribe
         segments, _ = whisper_model.transcribe(
@@ -346,7 +358,7 @@ Output only valid JSON:"""
         return json_output, transcript
         
     except Exception as e:
-        st.error(f"Chunk processing error: {str(e)}")
+        print(f"Chunk processing error: {str(e)}")
         return None, ""
 
 # --- Display Functions ---
@@ -391,19 +403,21 @@ def display_prescription_form(json_output):
 # --- Main Application ---
 
 def main():
-    st.title("Doctor's AI Assistant - Streaming Mode")
+    st.title("Doctor's AI Assistant - Real-Time Streaming")
     
     # Initialize session state
     if 'models_loaded' not in st.session_state:
         st.session_state.models_loaded = False
-    if 'streaming_active' not in st.session_state:
-        st.session_state.streaming_active = False
-    if 'accumulated_transcript' not in st.session_state:
-        st.session_state.accumulated_transcript = []
-    if 'accumulated_json' not in st.session_state:
-        st.session_state.accumulated_json = []
-    if 'audio_buffer' not in st.session_state:
-        st.session_state.audio_buffer = np.array([], dtype=np.int16)
+    if 'recording' not in st.session_state:
+        st.session_state.recording = False
+    if 'recorder' not in st.session_state:
+        st.session_state.recorder = None
+    if 'accumulated_transcripts' not in st.session_state:
+        st.session_state.accumulated_transcripts = []
+    if 'accumulated_jsons' not in st.session_state:
+        st.session_state.accumulated_jsons = []
+    if 'chunks_processed' not in st.session_state:
+        st.session_state.chunks_processed = 0
     
     # Sidebar
     with st.sidebar:
@@ -417,7 +431,8 @@ def main():
         st.write("Gemma: GPU (4-bit)")
         st.write("---")
         st.write(f"**Models Status:** {'✅ Loaded' if st.session_state.models_loaded else 'Not loaded'}")
-        st.write(f"**Streaming Status:** {'🔴 Active' if st.session_state.streaming_active else 'Inactive'}")
+        st.write(f"**Recording:** {'🔴 Active' if st.session_state.recording else 'Inactive'}")
+        st.write(f"**Chunks Processed:** {st.session_state.chunks_processed}")
 
     # Load models
     if not st.session_state.models_loaded:
@@ -439,104 +454,123 @@ def main():
 
     # Mode selection
     st.subheader("Select Mode:")
-    mode = st.radio("", ["Streaming Mode (Live Recording)", "Upload Audio File"], horizontal=True)
+    mode = st.radio("Processing Mode", ["Real-Time Microphone", "Upload Audio File"], horizontal=True)
     
-    if mode == "Streaming Mode (Live Recording)":
-        st.info("Click 'Start Recording' to begin live transcription and analysis. Speak naturally, and the system will process audio in intelligent chunks.")
+    if mode == "Real-Time Microphone":
+        st.info("Click 'Start Recording' to begin speaking. The system will continuously transcribe and analyze as you speak.")
         
         col1, col2 = st.columns(2)
         
         with col1:
-            if st.button("Start Recording", type="primary", disabled=st.session_state.streaming_active):
-                st.session_state.streaming_active = True
-                st.session_state.accumulated_transcript = []
-                st.session_state.accumulated_json = []
+            if st.button("🎤 Start Recording", type="primary", disabled=st.session_state.recording):
+                st.session_state.recording = True
+                st.session_state.accumulated_transcripts = []
+                st.session_state.accumulated_jsons = []
+                st.session_state.chunks_processed = 0
+                st.session_state.recorder = AudioRecorder(sample_rate=16000, chunk_duration=30)
+                st.session_state.recorder.start_recording()
                 st.rerun()
         
         with col2:
-            if st.button("Stop Recording", disabled=not st.session_state.streaming_active):
-                st.session_state.streaming_active = False
+            if st.button("⏹️ Stop Recording", disabled=not st.session_state.recording):
+                if st.session_state.recorder:
+                    st.session_state.recorder.stop_recording()
+                st.session_state.recording = False
                 st.rerun()
         
-        if st.session_state.streaming_active:
-            st.markdown("### 🔴 Recording Active")
+        if st.session_state.recording:
+            st.markdown("### 🔴 Recording Active - Speak Now")
+            st.warning("Processing happens in background every 30 seconds. Keep speaking naturally.")
             
-            # Audio recorder
-            audio = audiorecorder("", "", key="recorder")
+            # Create placeholders for live updates
+            transcript_placeholder = st.empty()
+            json_placeholder = st.empty()
+            status_placeholder = st.empty()
             
-            if len(audio) > 0:
-                # Convert audio to numpy array
-                audio_array = np.array(audio.get_array_of_samples(), dtype=np.int16)
-                
-                # Add to buffer
-                st.session_state.audio_buffer = np.concatenate([st.session_state.audio_buffer, audio_array])
-                
-                # Process if buffer is large enough (e.g., 30 seconds of audio)
-                sample_rate = audio.frame_rate
-                chunk_size = 30 * sample_rate
-                
-                if len(st.session_state.audio_buffer) >= chunk_size:
-                    with st.spinner("Processing audio chunk..."):
-                        # Split intelligently
-                        chunks = split_audio_intelligently(st.session_state.audio_buffer, sample_rate)
+            # Process audio chunks in real-time
+            while st.session_state.recording:
+                if st.session_state.recorder:
+                    audio_chunk = st.session_state.recorder.get_audio_chunk()
+                    
+                    if audio_chunk is not None:
+                        status_placeholder.info(f"Processing chunk {st.session_state.chunks_processed + 1}...")
                         
-                        for chunk in chunks[:-1]:  # Process all but last chunk
-                            json_output, transcript = process_audio_chunk(
-                                chunk, whisper_model, gemma_tokenizer, gemma_model, sample_rate
-                            )
-                            
-                            if transcript:
-                                st.session_state.accumulated_transcript.append(transcript)
-                            if json_output:
-                                st.session_state.accumulated_json.append(json_output)
+                        # Process chunk
+                        json_output, transcript = process_audio_chunk(
+                            audio_chunk,
+                            whisper_model,
+                            gemma_tokenizer,
+                            gemma_model
+                        )
                         
-                        # Keep last chunk in buffer
-                        st.session_state.audio_buffer = chunks[-1] if chunks else np.array([], dtype=np.int16)
-            
-            # Display accumulated results
-            if st.session_state.accumulated_transcript:
-                with st.expander("Live Transcript", expanded=True):
-                    st.write(" ".join(st.session_state.accumulated_transcript))
-            
-            if st.session_state.accumulated_json:
-                merged = merge_json_outputs(st.session_state.accumulated_json)
-                with st.expander("Extracted Information (Live)", expanded=True):
-                    st.json(merged)
+                        if transcript:
+                            st.session_state.accumulated_transcripts.append(transcript)
+                        
+                        if json_output:
+                            st.session_state.accumulated_jsons.append(json_output)
+                        
+                        st.session_state.chunks_processed += 1
+                        
+                        # Update displays
+                        if st.session_state.accumulated_transcripts:
+                            with transcript_placeholder.container():
+                                st.markdown("**Live Transcript:**")
+                                st.text_area(
+                                    "Transcript",
+                                    value=" ".join(st.session_state.accumulated_transcripts),
+                                    height=200,
+                                    key=f"live_trans_{st.session_state.chunks_processed}",
+                                    label_visibility="collapsed"
+                                )
+                        
+                        if st.session_state.accumulated_jsons:
+                            merged = merge_json_outputs(st.session_state.accumulated_jsons)
+                            with json_placeholder.container():
+                                st.markdown("**Extracted Information (Live):**")
+                                st.json(merged)
+                        
+                        status_placeholder.success(f"✅ Processed chunk {st.session_state.chunks_processed}")
+                
+                time.sleep(0.5)  # Check for new chunks every 0.5 seconds
         
         else:
-            # Streaming stopped - show final results
-            if st.session_state.accumulated_json:
-                st.success("✅ Recording completed!")
+            # Recording stopped - show final results
+            if st.session_state.accumulated_jsons:
+                # Process any remaining audio
+                if st.session_state.recorder:
+                    remaining_chunk = st.session_state.recorder.get_audio_chunk()
+                    if remaining_chunk is not None:
+                        with st.spinner("Processing final chunk..."):
+                            json_output, transcript = process_audio_chunk(
+                                remaining_chunk,
+                                whisper_model,
+                                gemma_tokenizer,
+                                gemma_model
+                            )
+                            if transcript:
+                                st.session_state.accumulated_transcripts.append(transcript)
+                            if json_output:
+                                st.session_state.accumulated_jsons.append(json_output)
                 
-                # Process any remaining buffer
-                if len(st.session_state.audio_buffer) > 0:
-                    with st.spinner("Processing final audio chunk..."):
-                        json_output, transcript = process_audio_chunk(
-                            st.session_state.audio_buffer, whisper_model, 
-                            gemma_tokenizer, gemma_model, 16000
-                        )
-                        if transcript:
-                            st.session_state.accumulated_transcript.append(transcript)
-                        if json_output:
-                            st.session_state.accumulated_json.append(json_output)
-                    st.session_state.audio_buffer = np.array([], dtype=np.int16)
+                st.success(f"✅ Recording completed! Processed {st.session_state.chunks_processed} chunks.")
                 
                 # Merge all results
-                final_json = merge_json_outputs(st.session_state.accumulated_json)
+                final_json = merge_json_outputs(st.session_state.accumulated_jsons)
                 
                 st.divider()
+                
                 with st.expander("Full Transcript", expanded=False):
-                    st.write(" ".join(st.session_state.accumulated_transcript))
+                    st.write(" ".join(st.session_state.accumulated_transcripts))
                 
                 with st.expander("Complete Extracted Data (JSON)", expanded=False):
                     st.json(final_json)
                 
                 display_prescription_form(final_json)
     
-    else:  # Upload mode
+    else:  # File upload mode
         st.info("Upload an audio file for batch processing.")
         
-        uploaded_file = st.file_uploader("Upload an audio file", type=["wav", "mp3", "m4a"])
+        uploaded_file = st.file_uploader("Upload an audio file", type=["wav", "mp3", "m4a", "ogg"])
         
         if uploaded_file is not None:
             st.audio(uploaded_file, format="audio/wav")
